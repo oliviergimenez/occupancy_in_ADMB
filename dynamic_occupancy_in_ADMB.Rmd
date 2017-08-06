@@ -1,0 +1,453 @@
+---
+title: "Fitting dynamic occupancy models in ADMB"
+author: "O. Gimenez"
+date: '`r Sys.time()`'
+output:
+  html_document: default
+---
+
+# Motivation
+
+Some time ago, a student of mine got stuck when fitting dynamic occupancy models to real data in Jags because of the computational burden. We had a dataset with several thousands sites, more than 20 seasons and 4 surveys per season (yeah!). We thought of using Unmarked instead (the likelihood is written in C++ and used through Rcpp), but dynamic models with false positives and/or random effects are not (yet?) implemented, and we were interested in considering both in our analysis. Some years ago, I had the opportunity to learn ADMB in a NCEAS meeting (thanks Hans Skaug!), I thought I would give it a try. ADMB allows you to write down any likelihood functions yourself and to incorporate random effects in an efficient way. It's known to be fast for reasons I won't go into here. Last but not least, ADMB can be run from R like JAGS and Unmarked (thanks Ben Bolker!). 
+
+Below I first simulate some data, then fit a dynamic model using ADMB, JAGS and Unmarked and finally perform a quick benchmarking. I'm going for a standard dynamic model, because the aims are i) to verify that JAGS is slower than Unmarked, ii) that ADMB is closer to Unmarked than JAGS in terms of time computation. If ii) is verified, then it will be worth the effort coding everything in ADMB.
+
+# Simule data
+
+Using code from Kery and Schaub book, I simulate occupancy data from a dynamic occupancy model using the following parameters: 
+```{r, message=FALSE, warning=FALSE}
+R = 100 # number of sites
+J = 5 # number of replicate surveys/visits
+K = 10 # number of years/seasons
+psi1 = 0.6 # occupancy prob in first year/season
+p = 0.7 # detection prob
+epsilon = 0.5 # extinction prob
+gamma = 0.3 # colonization prob
+real_param = c(psi1,gamma,epsilon,p)
+```
+
+Let's simulate:
+```{r, message=FALSE, warning=FALSE}
+# pre-allocate memory
+site <- 1:R # Sites
+year <- 1:K # Years
+psi <- rep(NA, K) # Occupancy probability
+muZ <- z <- array(dim = c(R, K)) # Expected and realized occurrence
+y <- array(NA, dim = c(R, J, K)) # Detection histories
+
+# define state process
+# first year/season
+z[,1] <- rbinom(R, 1, psi1) # Initial occupancy state
+# subsequent years/seasons
+for(i in 1:R){ # Loop over sites
+	for(k in 2:K){ # Loop over years
+		muZ[k] <- z[i, k-1]*(1-epsilon) + (1-z[i, k-1])*gamma # Prob for occ.
+		z[i,k] <- rbinom(1, 1, muZ[k])
+		}
+}
+
+# define observation process
+for(i in 1:R){
+	for(k in 1:K){
+		prob <- z[i,k] * p
+		for(j in 1:J){
+			y[i,j,k] <- rbinom(1, 1, prob)
+			}
+		}
+}
+
+# format data
+yy <- matrix(y, R, J*K)
+```
+
+# Model fitting in ADMB
+
+I recommend going through [the vignette of the R2admb package](https://cran.r-project.org/web/packages/R2admb/) first  if you'd like to use ADMB with R. I use the HMM formulation of dynamic occupancy models to write down the likelihood (e.g. [this paper](http://bit.ly/2vCHl4N) for a general presentation, and [that one](http://onlinelibrary.wiley.com/doi/10.1111/j.1541-0420.2005.00318.x/abstract) for details on the likelihood).
+
+```{r, message=FALSE, warning=FALSE}
+library(R2admb)
+model <- 
+paste("
+DATA_SECTION
+ init_int K // Number of seasons
+ init_int N // Number of seasons x surveys
+ init_int JJ // Number of time intervals between primary occasions
+ init_int nh // Number of sites
+ init_ivector e(1,nh) // Date of first capture
+ init_imatrix data(1,nh,1,N) // Data matrix
+ init_ivector eff(1,nh) // Number of individuals per capture history
+ init_ivector primary(1,K) // seasons
+ init_ivector secondarybis(1,JJ) // time intervals between primary occasions
+PARAMETER_SECTION
+ init_bounded_number logit_psi(-20.0,20.0,1) // init occupancy
+ init_bounded_number logit_det(-20.0,20.0,1) // detection
+ init_bounded_number logit_gam(-20.0,20.0,1) // colonization
+ init_bounded_number logit_eps(-20.0,20.0,1) // extinction
+ objective_function_value g
+// number psi
+// number det
+// number gam
+// number eps
+ sdreport_number psi
+ sdreport_number det
+ sdreport_number gam
+ sdreport_number eps
+ PROCEDURE_SECTION
+ psi = mfexp(logit_psi);
+ psi = psi/(1+psi); 
+ det = mfexp(logit_det);
+ det = det/(1+det); 
+ gam = mfexp(logit_gam);
+ gam = gam/(1+gam); 
+ eps = mfexp(logit_eps);
+ eps = eps/(1+eps); 
+ dvar_vector prop(1,2);
+ prop(1) = 1-psi; prop(2) = psi;
+ dvar_matrix B(1,2,1,2);
+ B(1,1) = 1;
+ B(1,2) = 1-det;
+ B(2,1) = 0.0;
+ B(2,2) = det;
+ dvar3_array PHI(1,N,1,2,1,2);
+ for(int i=1;i<=K;i++){
+ 	PHI(primary(i),1,1) = 1-gam;
+ 	PHI(primary(i),1,2) = gam;
+ 	PHI(primary(i),2,1) = eps;
+ 	PHI(primary(i),2,2) = 1-eps;
+ }
+ for(int j=1;j<=JJ;j++){
+ 	PHI(secondarybis(j),1,1) = 1;
+ 	PHI(secondarybis(j),1,2) = 0;
+ 	PHI(secondarybis(j),2,1) = 0;
+ 	PHI(secondarybis(j),2,2) = 1;
+ }
+
+ for(int i=1;i<=nh;i++){
+ 	int oe = e(i) + 1; // initial obs
+ 	ivector evennt = data(i)+1; //
+ 	dvar_vector ALPHA = elem_prod(prop,B(oe));
+ 	for(int j=2;j<=N;j++){
+ 		ALPHA = elem_prod(ALPHA*PHI(j-1),B(evennt(j)));
+ 		g -= log(sum(ALPHA))*eff(i);
+ 	}
+ }
+")
+writeLines(model,"model.tpl")
+setup_admb("/Applications/ADMBTerminal.app/admb")
+```
+
+We then format the data appropriately:
+```{r, message=FALSE, warning=FALSE}
+# various quantities
+nh <- nrow(yy) # nb sites
+eff = rep(1,nh) # nb sites with this particular history
+garb = yy[,1] # initial states
+
+# primary and secondary occasions
+primary = seq(J,J*K,by=J)
+secondary = 1:(J*K)
+secondary_bis = secondary[-primary]
+
+# further various quantities that will be useful later on
+K <- length(primary)
+J2 <- length(secondary)
+J <- J2/K
+N <- J * K
+JJ <- length(secondary_bis) # Number of time intervals between primary occasions
+
+# list of data
+df = list(K=K,N=N,JJ=JJ,nh=nh,e=garb,data=yy,eff=eff,primary=primary,secondarybis=secondary_bis)
+```
+
+We're now ready to fit the model:
+
+```{r, message=FALSE, warning=FALSE}
+params <- list(logit_psi = 0, logit_det = 0, logit_gam = 0, logit_eps = 0) ## starting parameters
+deb=Sys.time()
+res.admb <- do_admb('model', data=df, params = params,verbose=T)
+fin=Sys.time()
+fin-deb
+res.admb$coefficients[5:8]
+```
+
+# Model fitting in Unmarked
+
+```{r, message=FALSE, warning=FALSE}
+library(unmarked)
+simUMF <- unmarkedMultFrame(y = yy,numPrimary=K)
+deb=Sys.time()
+unmarked_code <- colext(psiformula= ~1, gammaformula = ~ 1, epsilonformula = ~ 1,
+pformula = ~ 1, data = simUMF, method="BFGS")
+fin=Sys.time()
+unmarked_code_time = fin-deb 
+unmarked_code_time
+
+psi_unmarked <- backTransform(unmarked_code, type="psi")
+col_unmarked <- backTransform(unmarked_code, type="col")
+ext_unmarked <- backTransform(unmarked_code, type="ext")
+p_unmarked <- backTransform(unmarked_code, type="det")
+psi_unmarked
+col_unmarked
+ext_unmarked
+p_unmarked
+```
+
+# Model fitting in JAGS
+
+Let's write the model first:
+```{r, message=FALSE, warning=FALSE}
+model <- 
+paste("
+    model{
+    #priors
+    p ~ dunif(0,1)
+    psi1 ~ dunif(0,1)
+    epsilon ~ dunif(0,1)
+    gamma~dunif(0,1)
+   
+    for(i in 1:n.sites){
+        # process
+        z[i,1] ~ dbern(psi1)
+        for(t in 2:n.seasons){ 
+            mu[i,t]<-((1-epsilon)*z[i,t-1])+(gamma*(1-z[i,t-1]))
+            z[i,t]~dbern(mu[i,t])
+        }
+        # obs
+        for(t in 1:n.seasons){ 
+            for(j in 1:n.occas){
+                p.eff[i,j,t] <- z[i,t]*p
+                y[i,j,t]~dbern(p.eff[i,j,t])
+            }
+        }
+    }
+}
+")
+writeLines(model,"dynocc.txt")
+```
+
+Create lists of data and initial values, set up which parameters to monitor
+```{r, message=FALSE, warning=FALSE}
+jags.data <- list(y=y,n.seasons=dim(y)[3],n.occas=dim(y)[2],n.sites=dim(y)[1])
+z.init <- apply(jags.data$y,c(1,3),max)
+initial <- function()list(p=runif(1,0,1),psi1=runif(1,0,1),z=z.init,epsilon=runif(1,0,1),gamma=runif(1,0,1))
+params.to.monitor <- c("psi1","gamma","epsilon","p")
+inits <- list(initial(),initial())
+```
+
+Fit model
+```{r, message=FALSE, warning=FALSE}
+library(jagsUI)
+res <- jagsUI(data=jags.data, inits, parameters.to.save=params.to.monitor, model.file="dynocc.txt",n.thin = 1,n.chains = 2, n.burnin = 500, n.iter =1000,parallel=TRUE)
+estim.jags = c(res$mean$psi1,res$mean$gamma,res$mean$epsilon,res$mean$p)
+```
+
+# Compare estimates
+
+```{r, message=FALSE, warning=FALSE}
+cat("parameters\n",c('occ','col','ext','det'),'\n')
+cat("real values\n",real_param,'\n')
+cat("Admb estimates\n",as.vector(res.admb$coefficients[c(5,7,8,6)]),'\n')
+cat("Unmarked estimates\n",c(psi_unmarked@estimate,col_unmarked@estimate,ext_unmarked@estimate,p_unmarked@estimate),'\n')
+cat("Jags estimates\n",estim.jags,'\n')
+```
+
+Not too bad.
+
+# Benchmarking
+
+Can ADMB compete with Unmarked in terms of computation times? What about JAGS?
+
+```{r, message=FALSE, warning=FALSE}
+library(microbenchmark)
+microbenchmark(
+do_admb('model', data=df, params = params),
+colext(psiformula= ~1, gammaformula = ~ 1, epsilonformula = ~ 1,pformula = ~ 1, data = simUMF, method="BFGS"),
+jagsUI(data=jags.data, inits, parameters.to.save=params.to.monitor, model.file="dynocc.txt",n.thin = 1,n.chains = 2, n.burnin = 500, n.iter =1000,parallel=TRUE),times=3)
+```
+
+As expected, Unmarked is the fastest, JAGS the slowest (2 parallel chains, I didn't check whether convergence was achieved). ADMB is not doing so bad. What if I had 1000 sites and 20 years:
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+R = 1000 # number of sites
+J = 5 # number of replicate surveys/visits
+K = 20 # number of years/seasons
+psi1 = 0.6 # occupancy prob in first year/season
+p = 0.7 # detection prob
+epsilon = 0.5 # extinction prob
+gamma = 0.3 # colonization prob
+real_param = c(psi1,gamma,epsilon,p)
+
+# pre-allocate memory
+site <- 1:R # Sites
+year <- 1:K # Years
+psi <- rep(NA, K) # Occupancy probability
+muZ <- z <- array(dim = c(R, K)) # Expected and realized occurrence
+y <- array(NA, dim = c(R, J, K)) # Detection histories
+
+# define state process
+# first year/season
+z[,1] <- rbinom(R, 1, psi1) # Initial occupancy state
+# subsequent years/seasons
+for(i in 1:R){ # Loop over sites
+	for(k in 2:K){ # Loop over years
+		muZ[k] <- z[i, k-1]*(1-epsilon) + (1-z[i, k-1])*gamma # Prob for occ.
+		z[i,k] <- rbinom(1, 1, muZ[k])
+		}
+}
+
+# define observation process
+for(i in 1:R){
+	for(k in 1:K){
+		prob <- z[i,k] * p
+		for(j in 1:J){
+			y[i,j,k] <- rbinom(1, 1, prob)
+			}
+		}
+}
+
+# format data
+yy <- matrix(y, R, J*K)
+
+library(R2admb)
+model <- 
+paste("
+DATA_SECTION
+ init_int K // Number of seasons
+ init_int N // Number of seasons x surveys
+ init_int JJ // Number of time intervals between primary occasions
+ init_int nh // Number of sites
+ init_ivector e(1,nh) // Date of first capture
+ init_imatrix data(1,nh,1,N) // Data matrix
+ init_ivector eff(1,nh) // Number of individuals per capture history
+ init_ivector primary(1,K) // seasons
+ init_ivector secondarybis(1,JJ) // time intervals between primary occasions
+PARAMETER_SECTION
+ init_bounded_number logit_psi(-20.0,20.0,1) // init occupancy
+ init_bounded_number logit_det(-20.0,20.0,1) // detection
+ init_bounded_number logit_gam(-20.0,20.0,1) // colonization
+ init_bounded_number logit_eps(-20.0,20.0,1) // extinction
+ objective_function_value g
+// number psi
+// number det
+// number gam
+// number eps
+ sdreport_number psi
+ sdreport_number det
+ sdreport_number gam
+ sdreport_number eps
+ PROCEDURE_SECTION
+ psi = mfexp(logit_psi);
+ psi = psi/(1+psi); 
+ det = mfexp(logit_det);
+ det = det/(1+det); 
+ gam = mfexp(logit_gam);
+ gam = gam/(1+gam); 
+ eps = mfexp(logit_eps);
+ eps = eps/(1+eps); 
+ dvar_vector prop(1,2);
+ prop(1) = 1-psi; prop(2) = psi;
+ dvar_matrix B(1,2,1,2);
+ B(1,1) = 1;
+ B(1,2) = 1-det;
+ B(2,1) = 0.0;
+ B(2,2) = det;
+ dvar3_array PHI(1,N,1,2,1,2);
+ for(int i=1;i<=K;i++){
+ 	PHI(primary(i),1,1) = 1-gam;
+ 	PHI(primary(i),1,2) = gam;
+ 	PHI(primary(i),2,1) = eps;
+ 	PHI(primary(i),2,2) = 1-eps;
+ }
+ for(int j=1;j<=JJ;j++){
+ 	PHI(secondarybis(j),1,1) = 1;
+ 	PHI(secondarybis(j),1,2) = 0;
+ 	PHI(secondarybis(j),2,1) = 0;
+ 	PHI(secondarybis(j),2,2) = 1;
+ }
+
+ for(int i=1;i<=nh;i++){
+ 	int oe = e(i) + 1; // initial obs
+ 	ivector evennt = data(i)+1; //
+ 	dvar_vector ALPHA = elem_prod(prop,B(oe));
+ 	for(int j=2;j<=N;j++){
+ 		ALPHA = elem_prod(ALPHA*PHI(j-1),B(evennt(j)));
+ 		g -= log(sum(ALPHA))*eff(i);
+ 	}
+ }
+")
+writeLines(model,"model.tpl")
+setup_admb("/Applications/ADMBTerminal.app/admb")
+
+# various quantities
+nh <- nrow(yy) # nb sites
+eff = rep(1,nh) # nb sites with this particular history
+garb = yy[,1] # initial states
+
+# primary and secondary occasions
+primary = seq(J,J*K,by=J)
+secondary = 1:(J*K)
+secondary_bis = secondary[-primary]
+
+# further various quantities that will be useful later on
+K <- length(primary)
+J2 <- length(secondary)
+J <- J2/K
+N <- J * K
+JJ <- length(secondary_bis) # Number of time intervals between primary occasions
+
+# list of data
+df = list(K=K,N=N,JJ=JJ,nh=nh,e=garb,data=yy,eff=eff,primary=primary,secondarybis=secondary_bis)
+params <- list(logit_psi = 0, logit_det = 0, logit_gam = 0, logit_eps = 0) ## starting parameters
+
+
+library(unmarked)
+simUMF <- unmarkedMultFrame(y = yy,numPrimary=K)
+
+model <- 
+paste("
+    model{
+    #priors
+    p ~ dunif(0,1)
+    psi1 ~ dunif(0,1)
+    epsilon ~ dunif(0,1)
+    gamma~dunif(0,1)
+   
+    for(i in 1:n.sites){
+        # process
+        z[i,1] ~ dbern(psi1)
+        for(t in 2:n.seasons){ 
+            mu[i,t]<-((1-epsilon)*z[i,t-1])+(gamma*(1-z[i,t-1]))
+            z[i,t]~dbern(mu[i,t])
+        }
+        # obs
+        for(t in 1:n.seasons){ 
+            for(j in 1:n.occas){
+                p.eff[i,j,t] <- z[i,t]*p
+                y[i,j,t]~dbern(p.eff[i,j,t])
+            }
+        }
+    }
+}
+")
+writeLines(model,"dynocc.txt")
+
+jags.data <- list(y=y,n.seasons=dim(y)[3],n.occas=dim(y)[2],n.sites=dim(y)[1])
+z.init <- apply(jags.data$y,c(1,3),max)
+initial <- function()list(p=runif(1,0,1),psi1=runif(1,0,1),z=z.init,epsilon=runif(1,0,1),gamma=runif(1,0,1))
+params.to.monitor <- c("psi1","gamma","epsilon","p")
+inits <- list(initial(),initial())
+
+library(microbenchmark)
+microbenchmark(
+do_admb('model', data=df, params = params),
+colext(psiformula= ~1, gammaformula = ~ 1, epsilonformula = ~ 1,pformula = ~ 1, data = simUMF, method="BFGS"),
+jagsUI(data=jags.data, inits, parameters.to.save=params.to.monitor, model.file="dynocc.txt",n.thin = 1,n.chains = 2, n.burnin = 500, n.iter =1000,parallel=TRUE),times=3)
+```
+
+The discrepancy is quite big! Not that time is in seconds here, in constrast with the previous benchmarking in which it was in milliseconds. 
+
+# Conclusions
+
+Based on these investigations, I decided to look into ADMB a bit further. I extended the model we used in [our recent paper on wolf recolonization](https://dl.dropboxusercontent.com/u/23160641/my-pubs/Louvrieretal2017Ecography.pdf) to account for false positives. It wasn't too difficult either to add covariates (whether they acted at the site, survey or season level). Now ADMB won't estimate the latent occupancy states, in contrast with JAGS which treats them as parameters. However, if needed, one could use the HMM machinery to get them, namely the Viterbi algorithm like in [Fiske et al. (2014)](https://link.springer.com/article/10.1007/s10651-013-0256-1).
+
+Hope this is useful.
